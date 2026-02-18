@@ -183,7 +183,9 @@ class PuffeRL:
             self.logger = NoLogger(config)
 
         # Learning rate scheduler
-        epochs = config['total_timesteps'] // config['batch_size']
+        # total_epochs can be 0 for short debug runs (total_timesteps < batch_size).
+        # Clamp to keep scheduler math well-defined and avoid divide-by-zero in train().
+        epochs = max(1, config['total_timesteps'] // config['batch_size'])
         eta_min = config['learning_rate'] * config['min_lr_ratio']
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=epochs, eta_min=eta_min)
@@ -210,6 +212,9 @@ class PuffeRL:
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.losses = {}
+        self.best_perf = float('-inf')
+        self.perfect_perf_count = 0  # Count times perf == 1.0
+        self.msg = ''
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -342,7 +347,7 @@ class PuffeRL:
         a = config['prio_alpha']
         clip_coef = config['clip_coef']
         vf_clip = config['vf_clip_coef']
-        anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
+        anneal_beta = b0 + (1 - b0)*a*self.epoch/max(1, self.total_epochs)
         self.ratio[:] = 1
 
         for mb in range(self.total_minibatches):
@@ -473,6 +478,14 @@ class PuffeRL:
             self.save_checkpoint()
             self.msg = f'Checkpoint saved at update {self.epoch}'
 
+        # Check for best performance and save if improved
+        if logs is not None:
+            perf = logs.get('environment/perf', float('-inf'))
+            if perf >= 1.0:
+                self.perfect_perf_count += 1
+            if self.save_best_checkpoint(perf):
+                self.msg = f'New best! perf={perf:.4f}'
+
         return logs
 
     def mean_and_log(self):
@@ -519,6 +532,20 @@ class PuffeRL:
         run_id = self.logger.run_id
         path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}.pt')
         shutil.copy(model_path, path)
+        
+        # Print training summary
+        best_path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}', f'model_{self.config["env"]}_best.pt')
+        print(f'\n{"="*50}')
+        print(f'TRAINING COMPLETE')
+        print(f'{"="*50}')
+        print(f'Best perf: {self.best_perf:.4f}')
+        print(f'Perfect scores (perf=1.0): {self.perfect_perf_count}')
+        if os.path.exists(best_path):
+            print(f'Best weights: {best_path}')
+        else:
+            print(f'Best weights: Not saved (no improvement detected)')
+        print(f'{"="*50}\n')
+        
         return path
 
     def save_checkpoint(self):
@@ -550,6 +577,25 @@ class PuffeRL:
         torch.save(state, state_path + '.tmp')
         os.replace(state_path + '.tmp', state_path)
         return model_path
+
+    def save_best_checkpoint(self, perf):
+        '''Save best model if current performance exceeds previous best.'''
+        if perf <= self.best_perf:
+            return False
+        
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return False
+        
+        self.best_perf = perf
+        run_id = self.logger.run_id
+        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}')
+        if not os.path.exists(path):
+            os.makedirs(path)
+        
+        best_path = os.path.join(path, f'model_{self.config["env"]}_best.pt')
+        torch.save(self.uncompiled_policy.state_dict(), best_path)
+        return True
 
     def print_dashboard(self, clear=False, idx=[0],
             c1='[cyan]', c2='[dim default]', b1='[bright_cyan]', b2='[default]'):

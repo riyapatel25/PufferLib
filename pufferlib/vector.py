@@ -2,6 +2,7 @@
 
 from pdb import set_trace as T
 
+import os
 import numpy as np
 import time
 import psutil
@@ -294,9 +295,16 @@ class Multiprocessing:
         self.observation_space = pufferlib.spaces.joint_space(self.single_observation_space, self.agents_per_batch)
         self.agent_ids = np.arange(num_agents).reshape(num_workers, agents_per_worker)
 
-        from multiprocessing import RawArray, set_start_method
-        # Mac breaks without setting fork... but setting it breaks sweeps on 2nd run
-        #set_start_method('fork')
+        # Native PufferEnvs often initialize native code (C/CUDA/OpenGL-ish state).
+        # Forking after that can produce hard-to-reproduce worker segfaults/hangs.
+        # Using spawn avoids inheriting that state in children.
+        import multiprocessing as mp
+        start_method = os.environ.get('PUFFERLIB_MP_START_METHOD')
+        if start_method is None and is_native:
+            start_method = 'spawn'
+        ctx = mp.get_context(start_method) if start_method else mp.get_context()
+
+        RawArray = ctx.RawArray
         self.shm = dict(
             observations=RawArray(obs_ctype, num_agents * int(np.prod(obs_shape))),
             actions=RawArray(atn_ctype, num_agents * int(np.prod(atn_shape))),
@@ -324,7 +332,8 @@ class Multiprocessing:
         )
         self.buf['semaphores'][:] = MAIN 
 
-        from multiprocessing import Pipe, Process
+        Pipe = ctx.Pipe
+        Process = ctx.Process
         self.send_pipes, w_recv_pipes = zip(*[Pipe() for _ in range(num_workers)])
         w_send_pipes, self.recv_pipes = zip(*[Pipe() for _ in range(num_workers)])
         self.recv_pipe_dict = {p: i for i, p in enumerate(self.recv_pipes)}
@@ -352,10 +361,29 @@ class Multiprocessing:
 
         self.ready_workers = []
         self.waiting_workers = []
+        self._last_alive_check = 0.0
+
+    def _assert_workers_alive(self):
+        # If a worker segfaults (native env crash), the trainer can otherwise hang forever
+        # waiting for semaphores/pipes. Fail fast with actionable context.
+        for idx, p in enumerate(self.processes):
+            if not p.is_alive():
+                raise RuntimeError(
+                    "PufferLib Multiprocessing worker died. "
+                    f"worker_idx={idx} pid={getattr(p, 'pid', None)} exitcode={getattr(p, 'exitcode', None)}. "
+                    "This usually indicates a native environment crash (segfault) inside an Ocean binding. "
+                    "Re-run with PYTHONFAULTHANDLER=1 to capture a traceback from the crashing worker."
+                )
 
     def recv(self):
         recv_precheck(self)
         while True:
+            # Don't do this on every spin; keep overhead negligible.
+            now = time.time()
+            if now - self._last_alive_check > 0.25:
+                self._last_alive_check = now
+                self._assert_workers_alive()
+
             # Bandaid patch for new experience buffer desync
             if self.sync_traj:
                 worker = self.waiting_workers[0]
@@ -445,6 +473,7 @@ class Multiprocessing:
         return o, r, d, t, infos, agent_ids, m
 
     def send(self, actions):
+        self._assert_workers_alive()
         actions = send_precheck(self, actions).reshape(self.atn_batch_shape)
         # TODO: What shape?
         
@@ -453,6 +482,7 @@ class Multiprocessing:
         self.buf['semaphores'][idxs] = STEP
 
     def async_reset(self, seed=0):
+        self._assert_workers_alive()
         # Flush any waiting workers
         while self.waiting_workers:
             worker = self.waiting_workers.pop(0)

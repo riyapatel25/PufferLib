@@ -447,6 +447,102 @@ class MOBA(nn.Module):
 
             return action, value
 
+class PicoPark(nn.Module):
+    """CNN-based policy for PicoPark with spatial awareness.
+    
+    Observation layout (1409 bytes total):
+      Grid: 4 channels x 14 height x 25 width = 1400 bytes
+        Channel 0: block_color (0=empty, 1-8=color)
+        Channel 1: agent_color (0=empty, 1-8=color)
+        Channel 2: bullet (0/1)
+        Channel 3: door (0/1) - single tile at door position
+      Extras: 9 bytes [self_color, self_row, self_col, goal_col, camera_col,
+                       has_key, door_unlocked, door_row, key_row]
+    """
+    def __init__(self, env, cnn_channels=64, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        
+        # Grid dimensions (must match picopark.py OBS_CHANNELS, view_height, view_width)
+        self.grid_h = 14
+        self.grid_w = 25
+        self.grid_size = self.grid_h * self.grid_w  # 350
+        self.num_channels = 5  # block_color, agent_color, bullet, goal, key_door
+        self.num_extras = 11  # key/door info including key_col, key_holder_idx
+        
+        # CNN for spatial features
+        # Input: (batch, 5, 14, 25)
+        # After conv1 (3x3, pad=1): (batch, 64, 14, 25)
+        # After conv2 (3x3, stride=2): (batch, 64, 6, 12)
+        self.cnn = nn.Sequential(
+            layer_init(nn.Conv2d(self.num_channels, cnn_channels, 3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(cnn_channels, cnn_channels, 3, stride=2)),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        
+        # CNN output size: 64 * 6 * 12 = 4608
+        cnn_out_h = (self.grid_h - 3 + 2 * 0) // 2 + 1  # 6
+        cnn_out_w = (self.grid_w - 3 + 2 * 0) // 2 + 1  # 12
+        cnn_out_size = cnn_channels * cnn_out_h * cnn_out_w
+        
+        # MLP for extras (self_color, position info, etc.)
+        self.flat = layer_init(nn.Linear(self.num_extras, 32))
+        
+        # Projection to hidden size
+        self.proj = layer_init(nn.Linear(cnn_out_size + 32, hidden_size))
+        
+        # Actor and value heads
+        self.actor = layer_init(nn.Linear(hidden_size, 6), std=0.01)  # 6 actions
+        self.value_fn = layer_init(nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_train(self, x, state=None):
+        return self.forward(x, state)
+
+    def encode_observations(self, observations, state=None):
+        batch = observations.shape[0]
+        
+        # Split grid and extras
+        grid_flat = observations[:, :self.num_channels * self.grid_size]
+        extras = observations[:, -self.num_extras:]
+        
+        # Reshape grid to (batch, channels, height, width)
+        # Layout in C: [ch0_all_cells | ch1_all_cells | ... | ch4_all_cells]
+        grid = grid_flat.view(batch, self.num_channels, self.grid_h, self.grid_w).float()
+        
+        # Normalize each channel appropriately:
+        # Ch 0-1 (block_color, agent_color): 0-8 -> /8
+        # Ch 2-3 (bullet, goal): already 0/1
+        # Ch 4 (key_door): 0-2 -> /2
+        grid[:, 0:2, :, :] = grid[:, 0:2, :, :] / 8.0  # Normalize colors
+        # Channels 2 and 3 are already 0/1
+        grid[:, 4, :, :] = grid[:, 4, :, :] / 2.0  # Normalize key_door (0=empty, 1=key, 2=door)
+        
+        # CNN features
+        cnn_features = self.cnn(grid)
+        
+        # Extras features (normalize by 255 since they're uint8)
+        extras_norm = extras.float() / 255.0
+        flat_features = F.relu(self.flat(extras_norm))
+        
+        # Combine and project
+        combined = torch.cat([cnn_features, flat_features], dim=1)
+        hidden = F.relu(self.proj(combined))
+        
+        return hidden
+
+    def decode_actions(self, flat_hidden):
+        value = self.value_fn(flat_hidden)
+        action = self.actor(flat_hidden)
+        return action, value
+
 class TrashPickup(nn.Module):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
         super().__init__()
